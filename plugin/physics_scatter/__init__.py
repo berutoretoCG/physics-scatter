@@ -4,17 +4,17 @@ Nothing Designer-specific is imported at module level so that the engine
 subpackage can run in a plain Python process (python -m physics_scatter.engine).
 """
 
-_panel = None
+_installed = None
 
 
 def initializeSDPlugin():
-    global _panel
-    from .panel import install
-    _panel = install()
+    global _installed
+    from .simulator import install
+    _installed = install()
 
 
 def uninitializeSDPlugin():
-    global _panel
-    from .panel import uninstall
-    uninstall(_panel)
-    _panel = None
+    global _installed
+    from .simulator import uninstall
+    uninstall(_installed)
+    _installed = None

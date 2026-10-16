@@ -1,10 +1,12 @@
 """Everything that touches the Designer API.
 
 A scatter is a compositing graph owned by the plugin (marked in its metadata) and
-used by one node in a user graph. Its settings are that node's parameters and its
-floor is the node's Floor image input. Simulating rebuilds the inside of the graph:
-linked bitmaps of the baked maps, wired to its Height and Object ID outputs. The
-graph can be renamed freely; its maps folder follows on the next simulation.
+used by one node in a user graph. Everything about it is on that node: its
+settings and Simulate switch are the node's parameters, its floor is the node's
+Floor image input, and the last result is written back into its parameters.
+Simulating rebuilds the inside of the graph: linked bitmaps of the baked maps,
+wired to its Height and Object ID outputs. The graph can be renamed freely; its
+maps folder follows on the next simulation.
 
 Package layout:
 
@@ -30,6 +32,7 @@ from sd.api.sdresource import EmbedMethod
 from sd.api.sdresourcebitmap import SDResourceBitmap
 from sd.api.sdresourcefolder import SDResourceFolder
 from sd.api.sdtexture import SDTexture
+from sd.api.sdtypebool import SDTypeBool
 from sd.api.sdtypefloat import SDTypeFloat
 from sd.api.sdtypeint import SDTypeInt
 from sd.api.sdtypestring import SDTypeString
@@ -46,6 +49,7 @@ from sd.api.sdvalueusage import SDValueUsage
 PREFIX = "PhysicsScatter_"
 ROOT_FOLDER = "PhysicsScatter"
 MARKER = "physics_scatter"  # graph metadata: the scatter's folder name on disk
+_USAGES_DONE = "physics_scatter_usages"  # graph metadata: the outputs' usages are current
 FLOOR = "floor"
 MESH_SLOTS = 8
 
@@ -63,15 +67,27 @@ _QUALITY = ("low", "medium", "high")
 
 
 def _param_specs():
-    specs = [dict(id="mesh_slots", type="int", default=1, label="Mesh slots", group="Meshes", min=1,
+    specs = [
+        dict(id="simulate", type="bool", default=False, label="Simulate", group="Run",
+             label_false="Idle", label_true="Simulate",
+             description="Switch to Simulate to drop the meshes and bake the maps (the node must be selected). "
+                         "It switches back to Idle when done; switch it to Idle yourself to cancel. "
+                         "Progress shows in Designer's status bar."),
+        dict(id="last_run", type="string", default="Not simulated yet.", label="Last simulation", group="Run",
+             description="Written by each simulation."),
+        dict(id="object_count", type="int", default=0, label="Object count", group="Run", min=0, max=5000,
+             clamp=False, description="Written by each simulation. Object ID = object index / Object count, so "
+                                      "round(Object ID × Object count) gives the index, 1 to Object count."),
+    ]
+    specs += [dict(id="mesh_slots", type="int", default=1, label="Mesh slots", group="Meshes", min=1,
                   max=MESH_SLOTS, description="How many mesh slots to show.")]
     for i in range(1, MESH_SLOTS + 1):
         group = f"Meshes/Mesh {i}"
         shown = None if i == 1 else f'input["mesh_slots"] >= {i}'
         specs += [
             dict(id=f"mesh{i}_path", type="string", default="", label="OBJ file", group=group, visible_if=shown,
-                 description="Path of a Wavefront .obj file (absolute, or relative to the .sbs). "
-                             "The panel's Add OBJ… button fills it in."),
+                 description="Path of a Wavefront .obj file, absolute or relative to the .sbs. Paste it (quotes are "
+                             "fine), or use Physics Scatter → Add OBJ files to selected scatter."),
             dict(id=f"mesh{i}_count", type="int", default=40, label="Count", group=group, visible_if=shown,
                  min=0, max=1000, clamp=False, description="How many copies of this mesh fall."),
             dict(id=f"mesh{i}_size", type="float", default=8.0, label="Size %", group=group, visible_if=shown,
@@ -94,15 +110,13 @@ def _param_specs():
         dict(id="floor_height", type="float", default=10.0, label="Floor height %", group="Floor", min=0.5,
              max=100.0, description="Height of white in the Floor input, in % of the texture width (the unit "
                                     "of the mesh sizes). Unused while nothing is connected to Floor."),
-        dict(id="object_count", type="int", default=0, label="Object count", group="Result", min=0, max=5000,
-             clamp=False, description="Written by Simulate. Object ID = object index / Object count, so "
-                                      "round(Object ID × Object count) gives the index, 1 to Object count."),
     ]
     return specs
 
 
 PARAMS = _param_specs()
-_TYPES = {"int": (SDTypeInt, SDValueInt), "float": (SDTypeFloat, SDValueFloat), "string": (SDTypeString, SDValueString)}
+_TYPES = {"int": (SDTypeInt, SDValueInt), "float": (SDTypeFloat, SDValueFloat),
+          "string": (SDTypeString, SDValueString), "bool": (SDTypeBool, SDValueBool)}
 _SPEC = {p["id"]: p for p in PARAMS}
 
 
@@ -124,6 +138,36 @@ def selected_nodes():
         return list(ui_manager().getCurrentGraphSelectedNodes() or [])
     except APIException:  # InvalidArgument when no graph view has focus
         return None
+
+
+def selected_in_all_views(limit=50):
+    """(graph, node) for the selected nodes of every open compositing graph view.
+    Works while another panel (e.g. Properties) has the focus."""
+    found = []
+    try:
+        ui = sd.getContext().getSDApplication().getUIMgr()
+        for i in range(ui.getGraphViewIDCount()):
+            view = ui.getGraphViewIDAt(i)
+            graph = ui.getGraphFromGraphViewID(view)
+            if not isinstance(graph, SDSBSCompGraph):
+                continue
+            nodes = list(ui.getGraphSelectedNodesFromGraphViewID(view) or [])
+            if len(nodes) <= limit:
+                found += [(graph, n) for n in nodes]
+    except APIException:
+        pass
+    return found
+
+
+def selected_scatter_nodes():
+    found = []
+    for graph, node in selected_in_all_views():
+        try:
+            if scatter_graph(node):
+                found.append((graph, node))
+        except APIException:  # deleted since the selection was read
+            pass
+    return found
 
 
 def package_file(package):
@@ -260,13 +304,42 @@ def ensure_unique_key(graph):
 
 # --------------------------------------------------------------- settings
 
+def has_param(graph, ident):
+    try:
+        return graph.getPropertyFromId(ident, SDPropertyCategory.Input) is not None
+    except APIException:
+        return False
+
+
 def get_value(node, ident):
-    value = node.getPropertyValueFromId(ident, SDPropertyCategory.Input)
+    try:
+        value = node.getPropertyValueFromId(ident, SDPropertyCategory.Input)
+    except APIException:  # ItemNotFound: a graph without this parameter
+        value = None
     return value.get() if value is not None else _SPEC[ident]["default"]
 
 
 def set_value(node, ident, value):
-    node.setInputPropertyValueFromId(ident, _TYPES[_SPEC[ident]["type"]][1].sNew(value))
+    """Set a parameter of the node, if it differs: every change makes Designer refresh
+    the node (and the Properties panel showing it)."""
+    if get_value(node, ident) != value:
+        node.setInputPropertyValueFromId(ident, _TYPES[_SPEC[ident]["type"]][1].sNew(value))
+
+
+def finish_run(node, status, object_count=None):
+    """Write a run's result on the node and switch Simulate back to Idle."""
+    with SDHistoryUtils.UndoGroup("Physics Scatter: result"):
+        _write_result(node, status, object_count)
+
+
+def _write_result(node, status, object_count):
+    try:
+        if object_count is not None:
+            set_value(node, "object_count", int(object_count))
+        set_value(node, "last_run", status)
+        set_value(node, "simulate", False)
+    except APIException:  # the node was deleted meanwhile
+        pass
 
 
 def _resolve_path(path, package):
@@ -319,23 +392,52 @@ def add_meshes(node, paths):
 
 # ------------------------------------------------------------- the graph
 
+def _same(a, b):
+    if isinstance(a, float) or isinstance(b, float):
+        return a is not None and b is not None and abs(float(a) - float(b)) < 1e-6
+    return a == b
+
+
+def _set_annotation(graph, prop, ident, value):
+    """Set a parameter annotation if it differs (see set_value: writes aren't free)."""
+    try:
+        current = graph.getPropertyAnnotationValueFromId(prop, ident)
+        current = current.get() if current is not None else None
+    except APIException:
+        current = None
+    if not _same(current, value.get()):
+        graph.setPropertyAnnotationValueFromId(prop, ident, value)
+
+
+def _set_node_annotation(node, ident, text):
+    try:
+        current = node.getAnnotationPropertyValueFromId(ident)
+        current = current.get() if current is not None else None
+    except APIException:
+        current = None
+    if current != text:
+        node.setAnnotationPropertyValueFromId(ident, SDValueString.sNew(text))
+
+
 def _apply_param(graph, spec):
     prop = graph.getPropertyFromId(spec["id"], SDPropertyCategory.Input)
     sd_type, sd_value = _TYPES[spec["type"]]
     if prop is None:
         prop = graph.newProperty(spec["id"], sd_type.sNew(), SDPropertyCategory.Input)
         graph.setPropertyValue(prop, sd_value.sNew(spec["default"]))
-    graph.setPropertyAnnotationValueFromId(prop, "label", SDValueString.sNew(spec["label"]))
-    graph.setPropertyAnnotationValueFromId(prop, "group", SDValueString.sNew(spec["group"]))
-    graph.setPropertyAnnotationValueFromId(prop, "description", SDValueString.sNew(spec.get("description", "")))
-    graph.setPropertyAnnotationValueFromId(prop, "visible_if", SDValueString.sNew(spec.get("visible_if") or ""))
-    if spec["type"] != "string":
-        graph.setPropertyAnnotationValueFromId(prop, "editor", SDValueString.sNew("slider"))
-        graph.setPropertyAnnotationValueFromId(prop, "min", sd_value.sNew(spec["min"]))
-        graph.setPropertyAnnotationValueFromId(prop, "max", sd_value.sNew(spec["max"]))
-        graph.setPropertyAnnotationValueFromId(prop, "clamp", SDValueBool.sNew(spec.get("clamp", True)))
+    for ident in ("label", "group", "description", "visible_if"):
+        _set_annotation(graph, prop, ident, SDValueString.sNew(spec.get(ident) or ""))
+    if spec["type"] == "bool":
+        _set_annotation(graph, prop, "editor", SDValueString.sNew("buttons"))
+        _set_annotation(graph, prop, "label_false", SDValueString.sNew(spec["label_false"]))
+        _set_annotation(graph, prop, "label_true", SDValueString.sNew(spec["label_true"]))
+    elif spec["type"] != "string":
+        _set_annotation(graph, prop, "editor", SDValueString.sNew("slider"))
+        _set_annotation(graph, prop, "min", sd_value.sNew(spec["min"]))
+        _set_annotation(graph, prop, "max", sd_value.sNew(spec["max"]))
+        _set_annotation(graph, prop, "clamp", SDValueBool.sNew(spec.get("clamp", True)))
         if "step" in spec:
-            graph.setPropertyAnnotationValueFromId(prop, "step", sd_value.sNew(spec["step"]))
+            _set_annotation(graph, prop, "step", sd_value.sNew(spec["step"]))
 
 
 def _usages(usage, components, colorspace):
@@ -361,10 +463,9 @@ def _ensure_structure(graph):
         node.setAnnotationPropertyValueFromId("identifier", SDValueString.sNew(FLOOR))
     for node in graph.getNodes():
         if _is_floor_input(node):
-            node.setAnnotationPropertyValueFromId("label", SDValueString.sNew("Floor"))
-            node.setAnnotationPropertyValueFromId(
-                "description", SDValueString.sNew("Optional heightmap the objects land on (tileable). "
-                                                  "Its height is set by Floor height %."))
+            _set_node_annotation(node, "label", "Floor")
+            _set_node_annotation(node, "description", "Optional heightmap the objects land on (tileable). "
+                                                      "Its height is set by Floor height %.")
 
     outputs = {}
     for node in graph.getOutputNodes():
@@ -373,17 +474,26 @@ def _ensure_structure(graph):
             outputs[ident] = node
         else:
             graph.deleteNode(node)
+    metadata = graph.getMetadataDict()
+    try:
+        usages_done = metadata.getPropertyValueFromId(_USAGES_DONE) is not None
+    except APIException:
+        usages_done = False
     for row, (ident, label, usage, description) in enumerate(OUTPUTS):
         node = outputs.get(ident)
         if node is None:
             node = graph.newNode("sbs::compositing::output")
             node.setPosition(float2(2 * _GRID, row * _GRID))
             node.setAnnotationPropertyValueFromId("identifier", SDValueString.sNew(ident))
+            node.setAnnotationPropertyValueFromId("usages", _usages(usage, "R", "Linear"))
             outputs[ident] = node
-        node.setAnnotationPropertyValueFromId("label", SDValueString.sNew(label))
-        node.setAnnotationPropertyValueFromId("description", SDValueString.sNew(description))
-        node.setAnnotationPropertyValueFromId("group", SDValueString.sNew(""))
-        node.setAnnotationPropertyValueFromId("usages", _usages(usage, "R", "Linear"))
+        elif not usages_done:  # an output made by 0.1/0.2 (Object ID was color then)
+            node.setAnnotationPropertyValueFromId("usages", _usages(usage, "R", "Linear"))
+        _set_node_annotation(node, "label", label)
+        _set_node_annotation(node, "description", description)
+        _set_node_annotation(node, "group", "")
+    if not usages_done:
+        metadata.setPropertyValueFromId(_USAGES_DONE, SDValueString.sNew("1"))
     return outputs
 
 
@@ -440,8 +550,8 @@ def give_own_graph(user_graph, node):
 
 def upgrade_legacy(node, job):
     """Turn a 0.1/0.2 scatter into a current one, settings taken from its job.json.
-    Its folder on disk stays the same; the outputs other than Height and Object ID
-    go away on the next simulation."""
+    Its folder on disk stays the same. The outputs other than Height and Object ID
+    are removed; Height and Object ID keep their connections."""
     graph = node.getReferencedResource()
     with SDHistoryUtils.UndoGroup("Physics Scatter: upgrade"):
         graph.getMetadataDict().setPropertyValueFromId(MARKER, SDValueString.sNew(graph.getIdentifier()))
@@ -554,10 +664,11 @@ def _owned_bitmaps(graph):
             and os.path.normcase(os.path.normpath(res.getFilePath())).startswith(prefix)]
 
 
-def apply_bake(graph, node, files, preview=None, object_count=None):
-    """Replace the scatter graph's maps with freshly baked files and write the object
-    count on its node. Everything in the graph but the outputs and the Floor input
-    belongs to the bake and is rebuilt."""
+def apply_bake(graph, node, files, preview=None, object_count=None, status=""):
+    """Replace the scatter graph's maps with freshly baked files and write the result
+    on its node (Object count, Last simulation, Simulate back to Idle), as one undo
+    step. Everything in the graph but the outputs and the Floor input belongs to the
+    bake and is rebuilt."""
     package = graph.getPackage()
     with SDHistoryUtils.UndoGroup("Physics Scatter: simulate"):
         outputs = _ensure_structure(graph)
@@ -599,11 +710,8 @@ def apply_bake(graph, node, files, preview=None, object_count=None):
             icon = SDTexture.sFromFile(preview)
             if icon is not None:
                 graph.setIcon(icon)
-        if node is not None and object_count is not None:
-            try:
-                set_value(node, "object_count", int(object_count))
-            except APIException:  # the node was deleted while simulating
-                pass
+        if node is not None:
+            _write_result(node, status, object_count)
 
 
 def _free_position(graph):
