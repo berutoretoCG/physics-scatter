@@ -1,0 +1,5 @@
+# Bundled third-party libraries (shipped in the release package, not in git)
+plugin/physics_scatter/_vendor/
+
+__pycache__/
+*.pyc
