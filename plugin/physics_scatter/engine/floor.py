@@ -11,17 +11,18 @@ from .sim import TILE
 
 
 def load(path, height):
-    """World heights from a .npy grayscale image (top row first, as written by the
-    panel). height: world height of white, as a fraction of the tile width."""
+    """World heights from a .npy image (top row first, as the panel copies it out of
+    Designer, at the source's bit depth). height: world height of white, as a
+    fraction of the tile width. Float images keep values outside 0..1."""
     img = np.load(path)
-    if img.ndim == 3:
-        img = img[..., :3].mean(axis=2)
+    if img.ndim == 3:  # gray + alpha: the gray; color: the mean of R, G, B
+        img = img[..., 0] if img.shape[2] == 2 else img[..., :3].mean(axis=2, dtype=np.float64)
     if img.dtype == np.uint16:
         values = img.astype(np.float32) / 65535.0
     elif img.dtype == np.uint8:
         values = img.astype(np.float32) / 255.0
     else:
-        values = np.clip(img.astype(np.float32), 0.0, 1.0)
+        values = np.nan_to_num(img.astype(np.float32))
     if values.shape[0] < 2 or values.shape[1] < 2:
         raise ValueError("floor heightmap is too small")
     return np.ascontiguousarray(values[::-1]) * float(height) * TILE

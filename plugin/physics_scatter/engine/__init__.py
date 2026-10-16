@@ -8,7 +8,6 @@ PYTHONPATH) so heavy work never blocks the Designer UI:
 Progress is reported as JSON lines on stdout.
 """
 
-import colorsys
 import json
 import os
 import sys
@@ -22,7 +21,7 @@ from . import objload, pngio
 from .bake import bake
 from .sim import TILE, simulate
 
-OUTPUTS = ("height", "normal", "roughness", "metallic", "mask", "object_id", "object_random")
+OUTPUTS = ("height", "object_id")
 
 
 def emit(kind, **payload):
@@ -37,33 +36,12 @@ def _progress(stage, lo, hi):
     return report
 
 
-def _object_materials(job, objects, rng):
-    rough_v = float(job.get("variation", {}).get("roughness", 0.0))
-    n = len(objects)
-    rough = np.zeros(n, np.float32)
-    metal = np.zeros(n, np.float32)
-    for k, obj in enumerate(objects):
-        spec = job["meshes"][obj["mesh"]]
-        rough[k] = np.clip(spec.get("roughness", 0.5) + rng.uniform(-rough_v, rough_v), 0.0, 1.0)
-        metal[k] = np.clip(spec.get("metallic", 0.0), 0.0, 1.0)
-    return rough, metal
-
-
 def _load_floor(job):
     """World heights of the floor heightmap, or None for flat ground."""
     spec = job.get("floor") or {}
     if not spec.get("data"):
         return None
     return floor_map.load(spec["data"], float(spec.get("height", 0.1)))
-
-
-def _id_colors(n, rng):
-    # Distinct, saturated colors so neighbouring objects are easy to tell apart.
-    hues = (np.arange(n) * 0.618033988749895 + rng.random()) % 1.0
-    rng.shuffle(hues)
-    sats = 0.55 + 0.45 * rng.random(n)
-    vals = 0.6 + 0.4 * rng.random(n)
-    return np.array([colorsys.hsv_to_rgb(h, s, v) for h, s, v in zip(hues, sats, vals)], np.float32)
 
 
 def run(job_path):
@@ -101,31 +79,19 @@ def run(job_path):
 
     res = int(job.get("resolution", 2048))
     ss = 2 if res <= 2048 else 1
-    in_maps = floor is not None and job["floor"].get("in_maps", True)
-    baked = bake(meshes, objects, poses, res, supersample=ss, progress=_progress("bake", 0.75, 0.9),
-                 floor=floor if in_maps else None)
+    baked = bake(meshes, objects, poses, res, supersample=ss, progress=_progress("bake", 0.75, 0.9), floor=floor)
 
     emit("progress", stage="write", value=0.9, message="writing maps")
     cov = baked.coverage
     ids = baked.object_id
     hit = ids >= 0
     safe_ids = np.where(hit, ids, 0)
-    rough, metal = _object_materials(job, objects, rng)
 
     z_peak = float(baked.z.max())
     height_scale = float(job.get("height_scale", 0.0)) or max(z_peak, 1e-6)
     height = baked.z / height_scale
-
-    n = baked.normal
-    green = n[..., 1] if job.get("normal_format", "directx") == "opengl" else -n[..., 1]
-    normal_rgb = np.stack([n[..., 0], green, n[..., 2]], axis=2) * 0.5 + 0.5
-
-    # Material maps: per-object values, anti-aliased with coverage at the edges.
-    roughness = rough[safe_ids] * cov
-    metallic = metal[safe_ids] * cov
-    id_rgb = np.where(hit[..., None], _id_colors(len(objects), rng)[safe_ids], 0.0)
-    rand = rng.random(len(objects)).astype(np.float32) * 0.98 + 0.02
-    object_random = np.where(hit, rand[safe_ids], 0.0)
+    # Object k of N (1-based) gets k / N: exact in 16 bits, round(value * N) gives k back.
+    object_id = np.where(hit, (ids + 1) / float(len(objects)), 0.0)
 
     files = {}
 
@@ -135,15 +101,12 @@ def run(job_path):
         files[name] = path
 
     save("height", pngio.to_u16(height))
-    save("normal", pngio.to_u8(normal_rgb))
-    save("roughness", pngio.to_u8(roughness))
-    save("metallic", pngio.to_u8(metallic))
-    save("mask", pngio.to_u8(cov))
-    save("object_id", pngio.to_u8(id_rgb))
-    save("object_random", pngio.to_u8(object_random))
+    save("object_id", pngio.to_u16(object_id))
 
     # Small shaded preview for the panel: clay objects, each a slightly different shade.
     step = max(1, res // 512)
+    n = baked.normal
+    rand = np.random.default_rng(seed).random(len(objects)).astype(np.float32)
     light = np.array([-0.45, 0.55, 0.7])
     light /= np.linalg.norm(light)
     lambert = np.clip((n * light).sum(axis=2), 0.0, 1.0)
