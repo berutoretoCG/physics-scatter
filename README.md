@@ -39,9 +39,10 @@ settings, a **Simulate** switch and the result. There is no separate panel.
      *Quality* (1 Low, 2 Medium, 3 High) and *Max sim time*.
 4. Optional floor: connect a tileable heightmap to the node's **Floor** input. It is read at
    its own bit depth (8-bit, 16-bit or float), and the objects land on it: white is half the
-   texture width high. The objects never sink into the floor, however fine its detail (a
-   pile from another scatter, say); in its narrowest gaps they may rest a little high. The
-   floor is always part of the Height output.
+   texture width high. The Height of another scatter (connected directly or through Dots)
+   is rebuilt at its real height instead, so the new objects pile on top at their true
+   size. The objects never sink into the floor, however fine its detail; in its narrowest
+   gaps they may rest a little high. The floor is always part of the Height output.
 5. With the node selected, switch **Simulate** on. Progress shows in Designer's status bar
    (bottom of the window). When it's done, the switch goes back to *Idle*, the outputs update
    in place (connections stay) and *Last simulation* says what happened. Switch it to *Idle*

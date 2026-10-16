@@ -211,6 +211,11 @@ class Simulator(QtCore.QObject):
         try:
             if sd_bridge.capture_floor(user_graph, node, floor_path):
                 job["floor"]["data"] = floor_path
+                # Another scatter's Height: rebuild that pile at its real height.
+                source = sd_bridge.floor_scatter(node)
+                white = sd_bridge.height_scale(source) if source is not None else None
+                if white:
+                    job["floor"].update(height=white, scatter=source.getIdentifier())
         except (Exception, sd_bridge.APIException) as exc:
             detail = str(exc) if isinstance(exc, ValueError) else repr(exc)
             raise _Abort(f"Could not read the image connected to Floor: {detail}")
@@ -261,7 +266,11 @@ class Simulator(QtCore.QObject):
         spec = job["job"]
         sim = result.get("simulation", {})
         settled = "settled" if sim.get("settled") else "time limit reached"
-        floor = ", on the Floor input" if spec["floor"].get("data") else ""
+        floor = ""
+        if spec["floor"].get("scatter"):
+            floor = f", on the pile of {spec['floor']['scatter']}"
+        elif spec["floor"].get("data"):
+            floor = ", on the Floor input"
         per_mesh = ""
         if len(spec["meshes"]) > 1:
             names = ", ".join(f"{os.path.splitext(os.path.basename(m['path']))[0]} {m['count']}" for m in spec["meshes"])
@@ -271,7 +280,7 @@ class Simulator(QtCore.QObject):
                    f"done in {result.get('total_time', 0):.0f}s.")
         try:
             sd_bridge.apply_bake(job["graph"], node, result["files"], result.get("preview"),
-                                 result.get("object_count"), summary)
+                                 result.get("object_count"), summary, result.get("height_scale_relative"))
         except (Exception, sd_bridge.APIException) as exc:
             return self._fail(node, f"Simulated, but updating the graph failed: {exc!r}")
         os.replace(job["pending_path"], job["job_path"])

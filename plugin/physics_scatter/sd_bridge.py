@@ -19,6 +19,7 @@ Package layout (for scatters made in the graph "my_material"):
 """
 
 import ctypes
+import json
 import os
 import re
 import struct
@@ -53,6 +54,8 @@ ROOT_FOLDER = "PhysicsScatter"
 TAGS = "physics scatter"
 MARKER = "physics_scatter"  # graph metadata: the scatter's folder name on disk
 _USAGES_DONE = "physics_scatter_usages"  # graph metadata: the outputs' usages are current
+_HEIGHT_SCALE = "physics_scatter_height"  # graph metadata: how high white is in its Height (see height_scale)
+PASSTHROUGH = "sbs::compositing::passthrough"  # the Dot node
 FLOOR = "floor"
 FLOOR_HEIGHT = 50.0  # % of the texture width: how high white in the Floor input is
 MESH_SLOTS = 8
@@ -555,7 +558,8 @@ def _ensure_structure(graph):
         if _is_floor_input(node):
             _set_node_annotation(node, "label", "Floor")
             _set_node_annotation(node, "description", "Optional heightmap the objects land on (tileable). "
-                                                      "White is half the texture width high.")
+                                                      "White is half the texture width high; another "
+                                                      "scatter's Height keeps its real height.")
 
     outputs = {}
     for node in graph.getOutputNodes():
@@ -673,6 +677,47 @@ def texture_to_npy(texture, path):
     write_npy(path, descr, (h, w) if channels == 1 else (h, w, channels), data)
 
 
+def height_scale(graph):
+    """How high white is in a scatter's Height output, as a fraction of the texture
+    width: each simulation scales Height so that white is the top of its pile. None
+    if it was never simulated."""
+    try:
+        value = graph.getMetadataDict().getPropertyValueFromId(_HEIGHT_SCALE)
+        if value is not None:
+            return float(value.get())
+    except (APIException, ValueError):
+        pass
+    # Simulations by 0.4.0 left it only in their result file.
+    folder = scatter_dir(graph)
+    try:
+        with open(os.path.join(folder, "job.json"), "r", encoding="utf-8") as f:
+            suffix = json.load(f)["file_suffix"]
+        with open(os.path.join(folder, f"result{suffix}.json"), "r", encoding="utf-8") as f:
+            return float(json.load(f)["height_scale_relative"])
+    except (OSError, TypeError, ValueError, KeyError):
+        return None
+
+
+def floor_scatter(node):
+    """The scatter graph whose Height is connected to node's Floor input, directly
+    or through Dot nodes; None for any other floor."""
+    prop = node.getPropertyFromId(FLOOR, SDPropertyCategory.Input)
+    connections = list(node.getPropertyConnections(prop)) if prop is not None else []
+    for _hop in range(64):
+        if not connections:
+            return None
+        source, source_prop = connections[0].getInputPropertyNode(), connections[0].getInputProperty()
+        try:
+            if source.getDefinition().getId() != PASSTHROUGH:
+                graph = scatter_graph(source)
+                return graph if graph is not None and source_prop.getId() == "height" else None
+            connections = [c for p in source.getProperties(SDPropertyCategory.Input)
+                           for c in source.getPropertyConnections(p)]
+        except APIException:
+            return None
+    return None
+
+
 def capture_floor(user_graph, node, path):
     """Compute what is connected to the node's Floor input and save it to path (.npy).
     Returns False when nothing is connected."""
@@ -742,10 +787,10 @@ def _owned_bitmaps(graph):
             and os.path.normcase(os.path.normpath(res.getFilePath())).startswith(prefix)]
 
 
-def apply_bake(graph, node, files, preview=None, object_count=None, status=""):
+def apply_bake(graph, node, files, preview=None, object_count=None, status="", white_height=None):
     """Replace the scatter graph's maps with freshly baked files and write the result
     on its node (Object count, Last simulation, Simulate back to Idle), as one undo
-    step. Everything in the graph but the outputs and the Floor input belongs to the
+    step. white_height: how high white is in the new Height (see height_scale). Everything in the graph but the outputs and the Floor input belongs to the
     bake and is rebuilt."""
     package = graph.getPackage()
     with SDHistoryUtils.UndoGroup("Physics Scatter: simulate"):
@@ -784,6 +829,8 @@ def apply_bake(graph, node, files, preview=None, object_count=None, status=""):
                 "$format", SDValueEnum.sFromValueId("sbs::compositing::format", "16_bits_per_channel"))
             bitmap.newPropertyConnectionFromId("unique_filter_output", outputs[ident], "inputNodeOutput")
 
+        if white_height:
+            graph.getMetadataDict().setPropertyValueFromId(_HEIGHT_SCALE, SDValueString.sNew(f"{white_height:.9g}"))
         if preview and os.path.isfile(preview):
             icon = SDTexture.sFromFile(preview)
             if icon is not None:
