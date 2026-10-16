@@ -24,20 +24,24 @@ settings, a **Simulate** switch and the result. There is no separate panel.
 
 1. Save your package (.sbs). Maps are written next to it, in `<package>_physics_scatter/`.
 2. Open the compositing graph you want the scatter in and pick **Physics Scatter → New scatter
-   node**. Pick one or more OBJ files: a `PhysicsScatter_N` node appears in the graph.
+   node**. Pick one or more OBJ files: a node appears in the graph. Its graph is named after
+   yours: `<your graph>_PhysicsScatter_N`.
 3. Select the node. In its Properties:
-   - **Run**: the *Simulate* switch, *Last simulation* (what the last run did, or why it
-     failed) and *Object count*.
-   - **Meshes**: *Mesh slots* (how many of the 8 slots show), then per mesh the *OBJ file*,
-     *Count*, *Size %* (of the texture width) and *Size variation %*. Paste a path into
-     *OBJ file* (quotes are fine), or use **Physics Scatter → Add OBJ files to selected scatter…**.
+   - At the top: the *Simulate* switch, *Last simulation* (what the last run did, or why it
+     failed), *Count* (how many objects fall), *Size %* (of the texture width) and
+     *Size variation %*.
+   - **Meshes**: *Mesh slots* (how many of the 8 slots show), then per mesh the *OBJ file*.
+     Paste a path into it (quotes are fine), or use **Physics Scatter → Add OBJ files to
+     selected scatter…**. With more than one slot, each mesh also has *Amount %* (its share
+     of Count, relative to the others: 100 and 50 give 2/3 and 1/3 of the objects) and
+     *Scale %* (its size, in % of Size %).
    - **Simulation**: *Resolution* of the maps, *Seed*, *Friction*, *Bounciness*,
      *Quality* (1 Low, 2 Medium, 3 High) and *Max sim time*.
-   - **Floor**: *Floor height %*, the height of white in the Floor input, in % of the
-     texture width.
 4. Optional floor: connect a tileable heightmap to the node's **Floor** input. It is read at
-   its own bit depth (8-bit, 16-bit or float), and the objects land on it. The floor is
-   always part of the Height output.
+   its own bit depth (8-bit, 16-bit or float), and the objects land on it: white is half the
+   texture width high. The objects never sink into the floor, however fine its detail (a
+   pile from another scatter, say); in its narrowest gaps they may rest a little high. The
+   floor is always part of the Height output.
 5. With the node selected, switch **Simulate** on. Progress shows in Designer's status bar
    (bottom of the window). When it's done, the switch goes back to *Idle*, the outputs update
    in place (connections stay) and *Last simulation* says what happened. Switch it to *Idle*
@@ -47,7 +51,7 @@ Outputs:
 
 - **Height**: 16-bit, floor included. White is the highest point.
 - **Object ID**: 16-bit gray. Object *k* of *N* is *k / N*, and the ground is black.
-  `round(Object ID × Object count)` gives the object's number, 1 to *N*.
+  *N* is in *Last simulation*; `round(Object ID × N)` gives the object's number, 1 to *N*.
 
 All maps tile seamlessly: objects that cross an edge continue on the opposite side.
 
@@ -56,18 +60,20 @@ and click Ok). A copied node shares its graph with the original until you simula
 then it gets its own graph, keeping its settings and connections.
 
 Everything the plugin adds to the package lives in one `PhysicsScatter` folder: the
-scatter graphs and a `<name>_maps` folder of bitmaps for each.
+scatter graphs and a `<name>_maps` folder of bitmaps for each. The scatter graphs are
+tagged `physics scatter` and hidden from the Library. They are still *Exposed in SBSAR*:
+Designer's Python API can't change that, so if you publish the package as .sbsar, untick
+it in each scatter graph's attributes.
 
-Scatters made with 0.1 or 0.2: select one and pick **Physics Scatter → Convert selected 0.2
-scatter**. The settings of its last bake move onto the node. Height and Object ID stay
-connected, and the other outputs (Normal, Roughness, …) are removed. A floor picked as a
-file in 0.2 must now be connected to the Floor input. Then switch Simulate on.
+Scatters made with 0.3 update when you select them: their per-mesh Count, Size % and Size
+variation % become the global ones plus each mesh's Amount % and Scale %, so they drop
+the same objects as before.
 
 Simulating takes roughly 5–10 s for ~100 objects and ~40 s for ~500 (Quality 2).
 A floor roughly doubles the simulation time. With a Floor connected, Designer computes
 your graph once when the simulation starts, which pauses Designer briefly on big graphs.
 
-## Limitations (version 0.3)
+## Limitations (version 0.4)
 
 - OBJ only (no FBX yet). One OBJ file = one rigid object; materials/UVs in the OBJ are ignored.
 - Collision uses each mesh's convex hull: concave shapes (rings, bowls) can't interlock.
@@ -75,6 +81,7 @@ your graph once when the simulation starts, which pauses Designer briefly on big
 - Designer's Python API can't make a drop-down list or a file browser on a node, nor run code
   when a parameter changes. So *Quality* is a number and *OBJ file* is a text field. The
   plugin also only notices the Simulate switch on a **selected** node.
+- Scatters made with 0.1 or 0.2 can't be converted any more: make a new scatter.
 - Changing the settings doesn't re-run the simulation by itself: switch Simulate on again.
 - The floor is treated as tileable and stretched to the square tile.
 - If you move or share the .sbs, keep the `<package>_physics_scatter/` folder next to it.

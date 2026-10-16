@@ -85,8 +85,8 @@ def _add_ground(spec, floor, samples, margin):
         ground.size = [0.0, 0.0, 1.0]
         return ground, 0.0
 
-    from .floor import resample  # floor imports TILE from here
-    grid = resample(floor, min(samples, max(floor.shape)))
+    from .floor import collision_grid  # floor imports TILE from here
+    grid = collision_grid(floor, min(samples, max(floor.shape)))
     cell = TILE / grid.shape[0]
     pad = int(math.ceil(margin / cell)) + 1
     grid = np.pad(grid, pad, mode="wrap")

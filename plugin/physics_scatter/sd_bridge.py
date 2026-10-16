@@ -5,15 +5,17 @@ used by one node in a user graph. Everything about it is on that node: its
 settings and Simulate switch are the node's parameters, its floor is the node's
 Floor image input, and the last result is written back into its parameters.
 Simulating rebuilds the inside of the graph: linked bitmaps of the baked maps,
-wired to its Height and Object ID outputs. The graph can be renamed freely; its
-maps folder follows on the next simulation.
+wired to its Height and Object ID outputs. The graph is named after the user graph
+it was made in and can be renamed freely; its maps folder follows on the next
+simulation.
 
-Package layout:
+Package layout (for scatters made in the graph "my_material"):
 
-    PhysicsScatter/                 folder
-        PhysicsScatter_1            graph
-        PhysicsScatter_1_maps/      folder with the linked bitmaps (files in the scatter's
-                                    folder on disk, named by the graph's metadata)
+    PhysicsScatter/                             folder
+        my_material_PhysicsScatter_1            graph
+        my_material_PhysicsScatter_1_maps/      folder with the linked bitmaps (files in the
+                                                scatter's folder on disk, named by the
+                                                graph's metadata)
 """
 
 import ctypes
@@ -46,19 +48,23 @@ from sd.api.sdvalueint import SDValueInt
 from sd.api.sdvaluestring import SDValueString
 from sd.api.sdvalueusage import SDValueUsage
 
-PREFIX = "PhysicsScatter_"
+NAME = "PhysicsScatter"  # scatter graphs are named <user graph>_PhysicsScatter_<n>
 ROOT_FOLDER = "PhysicsScatter"
+TAGS = "physics scatter"
 MARKER = "physics_scatter"  # graph metadata: the scatter's folder name on disk
 _USAGES_DONE = "physics_scatter_usages"  # graph metadata: the outputs' usages are current
 FLOOR = "floor"
+FLOOR_HEIGHT = 50.0  # % of the texture width: how high white in the Floor input is
 MESH_SLOTS = 8
+HIDDEN = "false"  # visible_if of the parameters the plugin uses but nobody needs to change
 
 # identifier, label, usage, description
 OUTPUTS = [
     ("height", "Height", "height",
      "Height of the pile, floor included. White is the highest point."),
     ("object_id", "Object ID", "objectId",
-     "Object index / Object count: each object has its own exact gray level, the ground is black."),
+     "Object k of N is k / N (N is in Last simulation): each object has its own exact gray level, "
+     "the ground is black."),
 ]
 OUTPUTS_IDS = tuple(o[0] for o in OUTPUTS)
 
@@ -67,33 +73,38 @@ _QUALITY = ("low", "medium", "high")
 
 
 def _param_specs():
+    # Ungrouped first: what you set on every scatter. Then the groups, then the hidden ones.
     specs = [
-        dict(id="simulate", type="bool", default=False, label="Simulate", group="Run",
-             label_false="Idle", label_true="Simulate",
+        dict(id="simulate", type="bool", default=False, label="Simulate", label_false="Idle", label_true="Simulate",
              description="Switch to Simulate to drop the meshes and bake the maps (the node must be selected). "
                          "It switches back to Idle when done; switch it to Idle yourself to cancel. "
                          "Progress shows in Designer's status bar."),
-        dict(id="last_run", type="string", default="Not simulated yet.", label="Last simulation", group="Run",
-             description="Written by each simulation."),
-        dict(id="object_count", type="int", default=0, label="Object count", group="Run", min=0, max=5000,
-             clamp=False, description="Written by each simulation. Object ID = object index / Object count, so "
-                                      "round(Object ID × Object count) gives the index, 1 to Object count."),
+        dict(id="last_run", type="string", default="Not simulated yet.", label="Last simulation",
+             description="Written by each simulation: how many objects fell, or why it failed."),
+        dict(id="count", type="int", default=80, label="Count", min=1, max=2000, clamp=False,
+             description="How many objects fall. With several meshes, their Amount % shares them out."),
+        dict(id="size", type="float", default=8.0, label="Size %", min=0.5, max=50.0,
+             description="Size of the objects, in % of the texture width."),
+        dict(id="size_variation", type="float", default=25.0, label="Size variation %", min=0.0, max=90.0,
+             description="Random size change per object, ± this %."),
+        dict(id="mesh_slots", type="int", default=1, label="Mesh slots", group="Meshes", min=1, max=MESH_SLOTS,
+             description="How many mesh slots to show."),
     ]
-    specs += [dict(id="mesh_slots", type="int", default=1, label="Mesh slots", group="Meshes", min=1,
-                  max=MESH_SLOTS, description="How many mesh slots to show.")]
     for i in range(1, MESH_SLOTS + 1):
         group = f"Meshes/Mesh {i}"
         shown = None if i == 1 else f'input["mesh_slots"] >= {i}'
+        several = 'input["mesh_slots"] > 1' if i == 1 else shown
         specs += [
             dict(id=f"mesh{i}_path", type="string", default="", label="OBJ file", group=group, visible_if=shown,
                  description="Path of a Wavefront .obj file, absolute or relative to the .sbs. Paste it (quotes are "
                              "fine), or use Physics Scatter → Add OBJ files to selected scatter."),
-            dict(id=f"mesh{i}_count", type="int", default=40, label="Count", group=group, visible_if=shown,
-                 min=0, max=1000, clamp=False, description="How many copies of this mesh fall."),
-            dict(id=f"mesh{i}_size", type="float", default=8.0, label="Size %", group=group, visible_if=shown,
-                 min=0.5, max=50.0, description="Size of the mesh, in % of the texture width."),
-            dict(id=f"mesh{i}_variation", type="float", default=25.0, label="Size variation %", group=group,
-                 visible_if=shown, min=0.0, max=90.0, description="Random size change per copy, ± this %."),
+            dict(id=f"mesh{i}_amount", type="float", default=100.0, label="Amount %", group=group,
+                 visible_if=several, min=0.0, max=100.0,
+                 description="This mesh's share of Count, relative to the other meshes: 100 and 50 give "
+                             "2/3 and 1/3 of the objects. Equal values share Count evenly."),
+            dict(id=f"mesh{i}_scale", type="float", default=100.0, label="Scale %", group=group,
+                 visible_if=several, min=10.0, max=400.0, clamp=False,
+                 description="Size of this mesh, in % of Size %."),
         ]
     specs += [
         dict(id="resolution", type="int", default=2048, label="Resolution", group="Simulation", min=256,
@@ -107,9 +118,11 @@ def _param_specs():
              description="1 = Low, 2 = Medium, 3 = High (smaller simulation steps, slower)."),
         dict(id="max_time", type="float", default=8.0, label="Max sim time (s)", group="Simulation", min=2.0,
              max=60.0, description="Simulation time limit. It stops earlier once everything is at rest."),
-        dict(id="floor_height", type="float", default=10.0, label="Floor height %", group="Floor", min=0.5,
-             max=100.0, description="Height of white in the Floor input, in % of the texture width (the unit "
-                                    "of the mesh sizes). Unused while nothing is connected to Floor."),
+        dict(id="object_count", type="int", default=0, label="Object count", visible_if=HIDDEN, min=0, max=5000,
+             clamp=False, description="Written by each simulation. Object ID = object index / Object count, so "
+                                      "round(Object ID × Object count) gives the index, 1 to Object count."),
+        dict(id="floor_height", type="float", default=FLOOR_HEIGHT, label="Floor height %", visible_if=HIDDEN,
+             min=0.5, max=100.0, description="Height of white in the Floor input, in % of the texture width."),
     ]
     return specs
 
@@ -199,15 +212,6 @@ def scatter_graph(node):
     return graph if scatter_key(graph) else None
 
 
-def is_legacy_scatter(node):
-    """A scatter made by 0.1/0.2: settings in the panel, many outputs, no marker."""
-    graph = node.getReferencedResource() if node is not None else None
-    if not isinstance(graph, SDSBSCompGraph) or scatter_key(graph):
-        return False
-    outputs = {_output_identifier(n) for n in graph.getOutputNodes()}
-    return graph.getIdentifier().startswith(PREFIX) and {"height", "normal"} <= outputs
-
-
 def scatter_dir(graph):
     root = scatter_root(graph.getPackage())
     return os.path.join(root, scatter_key(graph)) if root else None
@@ -281,12 +285,14 @@ def _is_floor_input(node):
             and _output_identifier(node) == FLOOR)
 
 
-def _free_name(package):
+def _free_name(package, user_graph):
+    """<user graph>_PhysicsScatter_<n>, with the first n not used in the package."""
+    base = f"{user_graph.getIdentifier()}_{NAME}_"
     used = {r.getIdentifier() for r in package.getChildrenResources(True)}
     n = 1
-    while f"{PREFIX}{n}" in used:
+    while f"{base}{n}" in used:
         n += 1
-    return f"{PREFIX}{n}"
+    return f"{base}{n}"
 
 
 def _new_key(graph):
@@ -311,12 +317,17 @@ def has_param(graph, ident):
         return False
 
 
-def get_value(node, ident):
+def _raw_value(node, ident):
     try:
         value = node.getPropertyValueFromId(ident, SDPropertyCategory.Input)
     except APIException:  # ItemNotFound: a graph without this parameter
-        value = None
-    return value.get() if value is not None else _SPEC[ident]["default"]
+        return None
+    return value.get() if value is not None else None
+
+
+def get_value(node, ident):
+    value = _raw_value(node, ident)
+    return _SPEC[ident]["default"] if value is None else value
 
 
 def set_value(node, ident, value):
@@ -350,16 +361,36 @@ def _resolve_path(path, package):
     return path
 
 
+def split_count(total, weights):
+    """Share total out in proportion to weights: whole numbers that add up to total
+    (largest remainders get the leftovers)."""
+    weight_sum = sum(weights)
+    if total <= 0 or weight_sum <= 0:
+        return [0] * len(weights)
+    exact = [total * w / weight_sum for w in weights]
+    counts = [int(e) for e in exact]
+    for i in sorted(range(len(weights)), key=lambda i: counts[i] - exact[i])[:total - sum(counts)]:
+        counts[i] += 1
+    return counts
+
+
 def read_settings(node):
     """The engine job settings held by a scatter node's parameters (sizes as fractions)."""
     package = node.getReferencedResource().getPackage()
-    meshes = []
-    for i in range(1, int(get_value(node, "mesh_slots")) + 1):
+    slots = int(get_value(node, "mesh_slots"))
+    several = slots > 1  # Amount % and Scale % only show with more than one slot
+    found = []
+    for i in range(1, slots + 1):
         path = _resolve_path(get_value(node, f"mesh{i}_path"), package)
         if path:
-            meshes.append(dict(path=path, count=int(get_value(node, f"mesh{i}_count")),
-                               size=get_value(node, f"mesh{i}_size") / 100.0,
-                               size_variation=get_value(node, f"mesh{i}_variation") / 100.0))
+            amount = max(0.0, float(get_value(node, f"mesh{i}_amount"))) if several else 100.0
+            scale = float(get_value(node, f"mesh{i}_scale")) if several else 100.0
+            found.append((path, amount, scale))
+    counts = split_count(int(get_value(node, "count")), [amount for _path, amount, _scale in found])
+    size = float(get_value(node, "size")) / 100.0
+    variation = float(get_value(node, "size_variation")) / 100.0
+    meshes = [dict(path=path, count=count, size=size * scale / 100.0, size_variation=variation)
+              for (path, _amount, scale), count in zip(found, counts)]
     quality = min(max(int(get_value(node, "quality")), 1), 3)
     return {
         "resolution": min(max(int(get_value(node, "resolution")), 64), 8192),
@@ -446,17 +477,76 @@ def _usages(usage, components, colorspace):
     return usages
 
 
+def is_current(graph):
+    """Whether the graph has this version's parameters (see ensure_structure)."""
+    return has_param(graph, "count")
+
+
 def ensure_structure(graph):
     """Bring a scatter graph made by an earlier 0.3 build up to date."""
     with SDHistoryUtils.UndoGroup("Physics Scatter: update"):
         _ensure_structure(graph)
 
 
+_PER_MESH_0_3 = ("count", "size", "variation")  # per-mesh parameters of 0.3.0 and 0.3.1
+
+
+def _take_0_3_settings(graph):
+    """0.3.0 and 0.3.1 had Count, Size % and Size variation % per mesh. Deletes the
+    graph's parameters, to be made again in this version's order (Designer lists
+    parameters in the order they were made and can't reorder them), and returns
+    what every node of the graph had in them."""
+    if not has_param(graph, "mesh1_count"):
+        return []
+    old = {f"mesh{i}_{name}" for i in range(1, MESH_SLOTS + 1) for name in _PER_MESH_0_3}
+    idents = [p.getId() for p in graph.getProperties(SDPropertyCategory.Input) if p.getId() in _SPEC or p.getId() in old]
+    taken = [(node, {ident: _raw_value(node, ident) for ident in idents}) for node in instances_of(graph)]
+    for ident in idents:
+        graph.deleteProperty(graph.getPropertyFromId(ident, SDPropertyCategory.Input))
+    return taken
+
+
+def _put_0_3_settings(taken):
+    """Back on the nodes: the settings kept, and the per-mesh ones of 0.3 as the
+    global Count, Size % and Size variation % plus each mesh's Amount % and Scale %
+    (same objects, same sizes). Floor height % goes to 50."""
+    for node, values in taken:
+        try:
+            for ident, value in values.items():
+                if ident in _SPEC and ident != "floor_height" and value is not None:
+                    set_value(node, ident, value)
+            meshes = [(i, values.get(f"mesh{i}_count"), values.get(f"mesh{i}_size"), values.get(f"mesh{i}_variation"))
+                      for i in range(1, int(values.get("mesh_slots") or 1) + 1)
+                      if (values.get(f"mesh{i}_path") or "").strip()]
+            if not meshes:
+                continue
+            counts = [max(0, int(count or 0)) for _i, count, _size, _variation in meshes]
+            first_size = float(meshes[0][2] or _SPEC["size"]["default"])
+            set_value(node, "count", max(1, sum(counts)))
+            set_value(node, "size", first_size)
+            set_value(node, "size_variation", float(meshes[0][3] or 0.0))
+            for (i, _count, size, _variation), n in zip(meshes, counts):
+                set_value(node, f"mesh{i}_amount", 100.0 * n / max(counts) if max(counts) else 100.0)
+                set_value(node, f"mesh{i}_scale", 100.0 * float(size or first_size) / first_size)
+        except APIException:  # a node that went away
+            pass
+
+
+def _set_graph_annotation(graph, ident, value):
+    current = graph.getAnnotationPropertyValueFromId(ident)
+    if current is None or current.get() != value.get():
+        graph.setAnnotationPropertyValueFromId(ident, value)
+
+
 def _ensure_structure(graph):
     """Parameters, Floor input and outputs, added if missing; the outputs of older
     versions (Normal, Roughness, …) are removed. Returns {identifier: output node}."""
+    taken = _take_0_3_settings(graph)
     for spec in PARAMS:
         _apply_param(graph, spec)
+    _put_0_3_settings(taken)
+    _set_graph_annotation(graph, "tags", SDValueString.sNew(TAGS))
+    _set_graph_annotation(graph, "show_in_library", SDValueBool.sNew(False))
     if not any(_is_floor_input(n) for n in graph.getNodes()):
         node = graph.newNode("sbs::compositing::input_grayscale")
         node.setPosition(float2(-2 * _GRID, 0.0))
@@ -465,7 +555,7 @@ def _ensure_structure(graph):
         if _is_floor_input(node):
             _set_node_annotation(node, "label", "Floor")
             _set_node_annotation(node, "description", "Optional heightmap the objects land on (tileable). "
-                                                      "Its height is set by Floor height %.")
+                                                      "White is half the texture width high.")
 
     outputs = {}
     for node in graph.getOutputNodes():
@@ -497,9 +587,10 @@ def _ensure_structure(graph):
     return outputs
 
 
-def _new_scatter_graph(package):
+def _new_scatter_graph(user_graph):
+    package = user_graph.getPackage()
     graph = SDSBSCompGraph.sNew(_folder(package, ROOT_FOLDER))
-    graph.setIdentifier(_free_name(package))
+    graph.setIdentifier(_free_name(package, user_graph))
     graph.getMetadataDict().setPropertyValueFromId(MARKER, SDValueString.sNew(_new_key(graph)))
     _ensure_structure(graph)
     return graph
@@ -508,7 +599,7 @@ def _new_scatter_graph(package):
 def create_scatter(user_graph):
     """A new scatter graph and its node in user_graph; returns the node."""
     with SDHistoryUtils.UndoGroup("New Physics Scatter"):
-        graph = _new_scatter_graph(user_graph.getPackage())
+        graph = _new_scatter_graph(user_graph)
         node = user_graph.newInstanceNode(graph)
         node.setPosition(_free_position(user_graph))
     return node
@@ -519,7 +610,7 @@ def give_own_graph(user_graph, node):
     connections. Used when its graph is shared (a copied node) or lives in another
     package, so that simulating it changes this node only. Returns the new node."""
     with SDHistoryUtils.UndoGroup("Physics Scatter: separate scatter"):
-        graph = _new_scatter_graph(user_graph.getPackage())
+        graph = _new_scatter_graph(user_graph)
         new = user_graph.newInstanceNode(graph)
         new.setPosition(node.getPosition())
         for prop in node.getProperties(SDPropertyCategory.Input):
@@ -546,47 +637,6 @@ def give_own_graph(user_graph, node):
                                                 conn.getInputProperty().getId())
         user_graph.deleteNode(node)
     return new
-
-
-def upgrade_legacy(node, job):
-    """Turn a 0.1/0.2 scatter into a current one, settings taken from its job.json.
-    Its folder on disk stays the same. The outputs other than Height and Object ID
-    are removed; Height and Object ID keep their connections."""
-    graph = node.getReferencedResource()
-    with SDHistoryUtils.UndoGroup("Physics Scatter: upgrade"):
-        graph.getMetadataDict().setPropertyValueFromId(MARKER, SDValueString.sNew(graph.getIdentifier()))
-        _ensure_structure(graph)
-        meshes = job.get("meshes", [])[:MESH_SLOTS]
-        for i, mesh in enumerate(meshes, start=1):
-            set_value(node, f"mesh{i}_path", mesh.get("path", ""))
-            set_value(node, f"mesh{i}_count", int(mesh.get("count", 40)))
-            set_value(node, f"mesh{i}_size", float(mesh.get("size", 0.08)) * 100.0)
-            set_value(node, f"mesh{i}_variation", float(mesh.get("size_variation", 0.25)) * 100.0)
-        set_value(node, "mesh_slots", max(1, len(meshes)))
-        physics = job.get("physics", {})
-        set_value(node, "resolution", int(job.get("resolution", 2048)))
-        set_value(node, "seed", int(job.get("seed", 1)))
-        set_value(node, "friction", float(physics.get("friction", 0.7)))
-        set_value(node, "bounciness", float(physics.get("bounciness", 0.1)))
-        quality = physics.get("quality", "medium")
-        set_value(node, "quality", _QUALITY.index(quality) + 1 if quality in _QUALITY else 2)
-        set_value(node, "max_time", float(physics.get("max_time", 8.0)))
-        floor = job.get("floor") or {}
-        set_value(node, "floor_height", float(floor.get("height", 0.1)) * 100.0)
-    return graph
-
-
-def rename_scatter(graph, name):
-    """Rename the graph; returns the identifier it got. Designer asks which references
-    to update (its "Affected Path(s)" dialog). The maps folder follows on the next
-    simulation."""
-    name = re.sub(r"\W", "_", name.strip())
-    if not name:
-        return graph.getIdentifier()
-    if name[0].isdigit():
-        name = "_" + name
-    graph.setIdentifier(name)
-    return graph.getIdentifier()
 
 
 # ----------------------------------------------------------------- floor
@@ -632,21 +682,49 @@ def capture_floor(user_graph, node, path):
         return False
     # Connections read from a node are seen from its side: the other end is the "input" one.
     source, source_prop = connections[0].getInputPropertyNode(), connections[0].getInputProperty()
-    # Only output nodes keep their texture after compute(): read it through a temporary one.
+    # Only output nodes reliably keep their texture after compute(): read it through a
+    # temporary one, else from the node itself; computing again once if both are empty.
     with SDHistoryUtils.UndoGroup("Physics Scatter: read floor"):
         probe = user_graph.newNode("sbs::compositing::output")
         try:
             source.newPropertyConnectionFromId(source_prop.getId(), probe, "inputNodeOutput")
-            user_graph.compute()
             out_prop = probe.getDefinition().getProperties(SDPropertyCategory.Output)[0]
-            value = probe.getPropertyValue(out_prop)
-            texture = value.get() if value is not None else None
+            texture = None
+            for _attempt in range(2):
+                user_graph.compute()
+                texture = _texture(probe, out_prop) or _texture(source, source_prop)
+                if texture is not None:
+                    break
             if texture is None:
-                raise ValueError("Designer did not compute the image connected to Floor.")
+                raise ValueError(f"Designer computed no image for {_describe(source)}, the node connected to Floor. "
+                                 f"Check that it shows an image in the 2D view and switch Simulate on again, "
+                                 f"or connect a Bitmap of the floor instead.")
             texture_to_npy(texture, path)
         finally:
             user_graph.deleteNode(probe)
     return True
+
+
+def _texture(node, prop):
+    try:
+        value = node.getPropertyValue(prop)
+        return value.get() if value is not None else None
+    except APIException:
+        return None
+
+
+def _describe(node):
+    """A node's name as the user sees it: its label, its graph's name or its kind."""
+    try:
+        label = node.getAnnotationPropertyValueFromId("label")
+        if label is not None and label.get():
+            return f'"{label.get()}"'
+        resource = node.getReferencedResource()
+        if resource is not None:
+            return f'"{resource.getIdentifier()}"'
+        return f'"{node.getDefinition().getLabel() or node.getDefinition().getId()}"'
+    except APIException:
+        return "the node"
 
 
 # ------------------------------------------------------------------ bake

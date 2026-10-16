@@ -28,15 +28,53 @@ def load(path, height):
     return np.ascontiguousarray(values[::-1]) * float(height) * TILE
 
 
-def resample(heights, n):
-    """Periodic resample to (n, n): bilinear to a multiple of n, then box-filtered,
-    so shrinking a big heightmap averages it instead of aliasing."""
-    h, w = heights.shape
-    factor = max(1, int(round(max(h, w) / n)))
-    size = n * factor
-    if (h, w) != (size, size):
-        heights = _bilinear_periodic(heights, size)
-    return heights.reshape(n, factor, n, factor).mean(axis=(1, 3))
+def collision_grid(heights, n, chunk_rows=16):
+    """(n, n) heightfield samples, at the cell centers of an n x n grid, that never
+    dip below the floor.
+
+    MuJoCo joins the samples into two triangles per cell, split along the diagonal
+    from sample (r, c) to (r + 1, c + 1). Averaged or point samples cut through
+    every peak narrower than a cell, and objects then sink into the floor's fine
+    detail (a pile used as the floor of another pile). So each sample starts at the
+    floor's height there and is raised by the most that any triangle it is a corner
+    of falls short of the floor. That raises every triangle to at least the floor,
+    everywhere in it, at the floor image's own resolution, and only around the
+    details the grid is too coarse for."""
+    k = max(1, -(-max(heights.shape) // n))  # fine pixels per cell: at least the floor's own resolution
+    m = n * k
+    fine = heights if heights.shape == (m, m) else _bilinear_periodic(heights, m)
+    fine = _dilate(fine)  # also covers the floor between the fine samples
+    # Cell c spans fine pixels c*k + s ... c*k + s + k - 1; u, v: their position in the cell (0..1).
+    s = k // 2
+    fine = np.roll(fine, (-s, -s), axis=(0, 1)).reshape(n, k, n, k).transpose(0, 2, 1, 3)
+    t = (np.arange(k) + s + 0.5) / k - 0.5
+    u, v = t[None, :], t[:, None]  # u along x (columns), v along y (rows)
+    lower = u >= v  # the triangle (r, c), (r + 1, c + 1), (r, c + 1)
+
+    h = _bilinear_periodic(heights, n).astype(np.float64)
+    h00, h10 = h, np.roll(h, -1, axis=1)
+    h01, h11 = np.roll(h, -1, axis=0), np.roll(h10, -1, axis=0)
+    short_lower = np.empty((n, n))
+    short_upper = np.empty((n, n))
+    for r0 in range(0, n, chunk_rows):
+        rows = slice(r0, r0 + chunk_rows)
+        a, b, c, d = (x[rows, :, None, None] for x in (h00, h10, h01, h11))
+        surface = np.where(lower, a + u * (b - a) + v * (d - b), a + v * (c - a) + u * (d - c))
+        deficit = fine[rows] - surface
+        short_lower[rows] = np.where(lower, deficit, -np.inf).max(axis=(2, 3))
+        short_upper[rows] = np.where(lower, -np.inf, deficit).max(axis=(2, 3))
+    # Sample (r, c) is a corner of both triangles of cell (r, c) and of cell (r - 1, c - 1),
+    # of the lower one of cell (r, c - 1) and of the upper one of cell (r - 1, c).
+    both = np.maximum(short_lower, short_upper)
+    lift = np.maximum.reduce([both, np.roll(both, (1, 1), axis=(0, 1)), np.roll(short_lower, 1, axis=1),
+                              np.roll(short_upper, 1, axis=0), np.zeros((n, n))])
+    return (h + lift).astype(np.float32)
+
+
+def _dilate(img):
+    """Periodic 3 x 3 maximum."""
+    img = np.maximum(img, np.maximum(np.roll(img, 1, axis=0), np.roll(img, -1, axis=0)))
+    return np.maximum(img, np.maximum(np.roll(img, 1, axis=1), np.roll(img, -1, axis=1)))
 
 
 def _bilinear_periodic(img, size):

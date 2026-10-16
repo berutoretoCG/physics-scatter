@@ -81,9 +81,10 @@ class Simulator(QtCore.QObject):
             return
         for user_graph, node in sd_bridge.selected_scatter_nodes():
             graph = sd_bridge.scatter_graph(node)
-            if not sd_bridge.has_param(graph, "simulate"):  # made by 0.3.0: add the Run group
+            if not sd_bridge.is_current(graph):  # made by 0.3.x: global Count, Size %, Size variation %
                 sd_bridge.ensure_structure(graph)
-                self._status(f"{graph.getIdentifier()} now has the Simulate switch (Run group).")
+                self._status(f"updated {graph.getIdentifier()}: Count, Size % and Size variation % are global now; "
+                             f"with several meshes, Amount % and Scale % share them out.")
             if self._switch_on(node):
                 self.start(user_graph, node)
                 return
@@ -194,9 +195,11 @@ class Simulator(QtCore.QObject):
         sd_bridge.ensure_structure(graph)
         job = sd_bridge.read_settings(node)
 
-        if not job["meshes"] or sum(m["count"] for m in job["meshes"]) == 0:
-            raise _Abort("Give the node at least one mesh (OBJ file) with a count above 0: paste a path into "
-                         "Meshes → Mesh 1 → OBJ file, or use Physics Scatter → Add OBJ files to selected scatter.")
+        if not job["meshes"]:
+            raise _Abort("Give the node a mesh (OBJ file): paste a path into Meshes → Mesh 1 → OBJ file, "
+                         "or use Physics Scatter → Add OBJ files to selected scatter.")
+        if sum(m["count"] for m in job["meshes"]) == 0:
+            raise _Abort("Nothing to drop: Count is 0, or every mesh's Amount % is 0.")
         missing = [m["path"] for m in job["meshes"] if not os.path.isfile(m["path"])]
         if missing:
             raise _Abort("File not found:\n" + "\n".join(missing))
@@ -209,7 +212,8 @@ class Simulator(QtCore.QObject):
             if sd_bridge.capture_floor(user_graph, node, floor_path):
                 job["floor"]["data"] = floor_path
         except (Exception, sd_bridge.APIException) as exc:
-            raise _Abort(f"Could not read the image connected to Floor: {exc!r}")
+            detail = str(exc) if isinstance(exc, ValueError) else repr(exc)
+            raise _Abort(f"Could not read the image connected to Floor: {detail}")
         job.update(scatter=graph.getIdentifier(), output_dir=out_dir)
         return job, graph, node, notes
 
@@ -258,8 +262,13 @@ class Simulator(QtCore.QObject):
         sim = result.get("simulation", {})
         settled = "settled" if sim.get("settled") else "time limit reached"
         floor = ", on the Floor input" if spec["floor"].get("data") else ""
-        summary = (f"{result['object_count']} objects{floor}, {sim.get('sim_time', 0):.1f}s simulated ({settled}), "
-                   f"coverage {result.get('coverage', 0) * 100:.0f}%, done in {result.get('total_time', 0):.0f}s.")
+        per_mesh = ""
+        if len(spec["meshes"]) > 1:
+            names = ", ".join(f"{os.path.splitext(os.path.basename(m['path']))[0]} {m['count']}" for m in spec["meshes"])
+            per_mesh = f" ({names})"
+        summary = (f"{result['object_count']} objects{per_mesh}{floor}, {sim.get('sim_time', 0):.1f}s simulated "
+                   f"({settled}), coverage {result.get('coverage', 0) * 100:.0f}%, "
+                   f"done in {result.get('total_time', 0):.0f}s.")
         try:
             sd_bridge.apply_bake(job["graph"], node, result["files"], result.get("preview"),
                                  result.get("object_count"), summary)
@@ -309,22 +318,6 @@ class Simulator(QtCore.QObject):
         if left:
             self._fail(None, f"The node has {sd_bridge.MESH_SLOTS} mesh slots; not added:\n" + "\n".join(left))
 
-    def convert_legacy(self):
-        old = [(g, n) for g, n in sd_bridge.selected_in_all_views() if sd_bridge.is_legacy_scatter(n)]
-        if len(old) != 1:
-            return self._fail(None, "Select one scatter made by Physics Scatter 0.1 or 0.2 first.")
-        user_graph, node = old[0]
-        root = sd_bridge.scatter_root(user_graph.getPackage())
-        name = node.getReferencedResource().getIdentifier()
-        job = {}
-        job_path = os.path.join(root, name, "job.json") if root else ""
-        if os.path.isfile(job_path):
-            with open(job_path, "r", encoding="utf-8") as f:
-                job = json.load(f)
-        sd_bridge.upgrade_legacy(node, job)
-        self._status(f"converted {name}: its settings are on the node now. Switch Simulate on to bake it again "
-                     f"(a floor file from 0.2 must be connected to the Floor input).")
-
 
 # --------------------------------------------------------------- plugin glue
 
@@ -342,7 +335,6 @@ def install():
     menu = ui.newMenu("Physics Scatter", MENU_ID)
     menu.addAction("New scatter node").triggered.connect(lambda: simulator.new_scatter())
     menu.addAction("Add OBJ files to selected scatter…").triggered.connect(lambda: simulator.add_meshes())
-    menu.addAction("Convert selected 0.2 scatter").triggered.connect(simulator.convert_legacy)
     return _Installed(simulator, menu)
 
 
